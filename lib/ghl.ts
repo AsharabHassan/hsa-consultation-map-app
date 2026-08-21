@@ -1,0 +1,230 @@
+import type { LeadPayload, SkinAnalysis } from "./types";
+import { planSummary } from "./booking";
+import { META_PIXEL_ID } from "./meta";
+
+export function configuredWebhookUrl(): string | null {
+  const candidate = process.env.GHL_WEBHOOK_URL?.trim();
+  if (!candidate || candidate === "[SENSITIVE]") return null;
+  try {
+    const url = new URL(candidate);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Meta Conversions API fields forwarded to GHL for server-side event matching. */
+export interface GhlMeta {
+  event_id?: string;
+  event_name?: string;
+  event_source_url?: string;
+  fbp?: string;
+  fbc?: string;
+  fbclid?: string;
+  client_user_agent?: string;
+  client_ip_address?: string;
+}
+
+/**
+ * Builds GhlMeta from the client-sent `meta` object plus server-only signals
+ * (user-agent + IP) read from the request headers. Shared by both the lead and
+ * concerns routes so the two webhooks carry identical Meta fields.
+ */
+export function parseGhlMeta(input: unknown, req: Request): GhlMeta {
+  const o = (typeof input === "object" && input !== null ? input : {}) as Record<
+    string,
+    unknown
+  >;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const ipHeader =
+    req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? "";
+  return {
+    event_id: str(o.event_id),
+    event_name: str(o.event_name) || "Lead",
+    event_source_url: str(o.event_source_url),
+    fbp: str(o.fbp),
+    fbc: str(o.fbc),
+    fbclid: str(o.fbclid),
+    client_user_agent: req.headers.get("user-agent") ?? "",
+    client_ip_address: ipHeader.split(",")[0]?.trim() ?? "",
+  };
+}
+
+/**
+ * Shapes the lead into the flat JSON GoHighLevel inbound webhooks expect.
+ * Field names are chosen to map cleanly onto GHL contact fields + GHL's
+ * Facebook Conversions API action.
+ */
+export function buildGhlPayload(lead: LeadPayload, meta: GhlMeta = {}) {
+  const [firstName, ...rest] = lead.name.trim().split(/\s+/);
+  return {
+    // ---- CRM contact fields ----
+    firstName: firstName ?? "",
+    lastName: rest.join(" "),
+    full_name: lead.name.trim(),
+    email: lead.email.trim().toLowerCase(),
+    phone: lead.phone.trim(),
+    skin_goals: lead.goals.join(", "),
+    marketing_consent: lead.consent ? "yes" : "no",
+    source: "HSA Facial Consultation Map",
+    submitted_at: new Date().toISOString(),
+
+    // ---- Meta Conversions API mapping (for GHL → Meta dedup) ----
+    pixel_id: META_PIXEL_ID,
+    action_source: "website",
+    event_name: meta.event_name ?? "Lead",
+    event_id: meta.event_id ?? "",
+    event_source_url: meta.event_source_url ?? "",
+    fbp: meta.fbp ?? "",
+    fbc: meta.fbc ?? "",
+    fbclid: meta.fbclid ?? "",
+    client_user_agent: meta.client_user_agent ?? "",
+    client_ip_address: meta.client_ip_address ?? "",
+  };
+}
+
+export async function pushLeadToGhl(
+  lead: LeadPayload,
+  meta: GhlMeta = {},
+): Promise<void> {
+  const url = configuredWebhookUrl();
+  if (!url) {
+    console.warn("[ghl] GHL_WEBHOOK_URL is not configured; lead push skipped.");
+    return;
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildGhlPayload(lead, meta)),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`GHL webhook returned ${res.status}: ${body.slice(0, 200)}`);
+  }
+}
+
+/**
+ * The SECOND webhook, sent AFTER the analysis finishes. It carries EVERY field
+ * the first (lead) webhook sends — reusing buildGhlPayload — PLUS the flattened
+ * skin analysis, so the event is a complete, self-contained contact record.
+ * Only `event_name` is overridden so the GHL workflow can branch on it; matched
+ * to the existing contact by email (the workflow should upsert by email).
+ */
+export function buildConcernsPayload(
+  lead: LeadPayload,
+  analysis: SkinAnalysis,
+  meta: GhlMeta = {},
+) {
+  const high = analysis.consultationPlan.highPriority;
+  const medium = analysis.consultationPlan.mediumPriorities;
+  const summary = planSummary(analysis.consultationPlan);
+  const treatmentOptions = [...new Set([high, ...medium].map((item) => item.treatmentRoute))];
+  return {
+    // ---- All first-webhook fields (contact + Meta CAPI) ----
+    ...buildGhlPayload(lead, meta),
+
+    // Override the event label to distinguish from the initial "Lead" event.
+    event_name: "HsaConsultationMapCompleted",
+
+    // ---- Flattened skin analysis ----
+    skin_concerns: analysis.annotations.map((a) => a.area).join(", "),
+    skin_scores: analysis.categories
+      .map((c) => `${c.label}: ${c.score}`)
+      .join(", "),
+    skin_summary: analysis.summary,
+    // Legacy fields stay populated so existing GHL workflows do not break.
+    // They now carry the consultation-map summary rather than a product-only plan.
+    veluria_recommendation: summary,
+
+    // The matched plan and the headline area, derived here from the analysis
+    // rather than taken from the client. The CRM then holds what the client was
+    // actually shown even when they never click through to the calendar, so a
+    // consultation can open on their concern instead of a blank slot request.
+    veluria_plan: summary,
+    focus_area: high.area,
+
+    // Consultation-map fields for personal follow-up and conversion reporting.
+    primary_concern: `${high.area}: ${high.concern}`,
+    high_priority_plan: `${high.area}: ${high.treatmentRoute} — ${high.consultationObjective}`,
+    medium_priority_plan: medium
+      .map((item) => `${item.area}: ${item.treatmentRoute}`)
+      .join("; "),
+    secondary_priority_plan: medium
+      .map((item) => `${item.area}: ${item.treatmentRoute}`)
+      .join("; "),
+    treatment_options: treatmentOptions.join(", "),
+    expected_results: [high, ...medium]
+      .map((item) => `${item.area}: ${item.expectedDirection}`)
+      .join("; "),
+    price_guidance: [high, ...medium]
+      .map((item) => `${item.area}: ${item.priceGuide}`)
+      .join("; "),
+    consultation_summary: `${analysis.summary} ${summary}`,
+  };
+}
+
+/**
+ * A results-page funnel event (map seen, CTA clicked, and similar milestones).
+ *
+ * Deliberately the same flat shape as the other two webhooks so one GHL inbound
+ * hook can branch on `event_name`, and carries only an email plus the event —
+ * these fire repeatedly per session and must stay cheap.
+ */
+export function buildEventPayload(
+  email: string,
+  event: string,
+  detail: { plan?: string; focus?: string; placement?: string } = {},
+  meta: GhlMeta = {},
+) {
+  return {
+    email: email.trim().toLowerCase(),
+    source: "HSA Facial Consultation Map",
+    event_name: event,
+    occurred_at: new Date().toISOString(),
+    veluria_plan: detail.plan ?? "",
+    focus_area: detail.focus ?? "",
+    cta_placement: detail.placement ?? "",
+
+    pixel_id: META_PIXEL_ID,
+    action_source: "website",
+    event_id: meta.event_id ?? "",
+    event_source_url: meta.event_source_url ?? "",
+    fbp: meta.fbp ?? "",
+    fbc: meta.fbc ?? "",
+    fbclid: meta.fbclid ?? "",
+    client_user_agent: meta.client_user_agent ?? "",
+    client_ip_address: meta.client_ip_address ?? "",
+  };
+}
+
+/**
+ * Best-effort: pushes the full lead + analysis concerns to GHL. Mirrors
+ * pushLeadToGhl — same webhook URL, same "log and skip if not configured"
+ * fallback so a failure never disrupts the user reaching their results.
+ */
+export async function pushConcernsToGhl(
+  lead: LeadPayload,
+  analysis: SkinAnalysis,
+  meta: GhlMeta = {},
+): Promise<void> {
+  const url = configuredWebhookUrl();
+  if (!url) {
+    console.warn("[ghl] GHL_WEBHOOK_URL is not configured; concerns push skipped.");
+    return;
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildConcernsPayload(lead, analysis, meta)),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `GHL concerns webhook returned ${res.status}: ${body.slice(0, 200)}`,
+    );
+  }
+}

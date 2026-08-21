@@ -1,0 +1,9 @@
+.next
+.vercel
+node_modules
+artifacts
+docs
+email-templates
+.env*
+*.log
+.playwright-mcp
