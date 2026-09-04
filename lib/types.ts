@@ -55,6 +55,13 @@ export interface ConsultationPlan {
   mediumPriorities: ConsultationPlanItem[];
 }
 
+export interface ClassifierSecondOpinion {
+  label: string;
+  probability: number;
+  threshold: number;
+  agrees: boolean;
+}
+
 export interface FaceAnnotation {
   x: number;
   y: number;
@@ -63,6 +70,10 @@ export interface FaceAnnotation {
   priority: ConsultationPriority;
   treatment: TreatmentRoute;
   severity: "low" | "moderate" | "notable";
+  /** Classifier region id echoed back in lead mode; absent otherwise. */
+  region?: string;
+  /** What the clinic classifier thought of this pin. Never shown to a client. */
+  secondOpinion?: ClassifierSecondOpinion;
 }
 
 export interface SkinAnalysis {

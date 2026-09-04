@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test:consultation": "tsx --test lib/consultation.test.ts"
+    "test:consultation": "tsx --test lib/consultation.test.ts",
+    "test:classifier": "tsx --test lib/classifierLead.test.ts",
+    "test": "tsx --test lib/consultation.test.ts lib/classifierLead.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

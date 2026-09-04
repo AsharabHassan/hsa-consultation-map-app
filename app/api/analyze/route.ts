@@ -5,6 +5,16 @@ import {
   consultationUserPrompt,
 } from "@/lib/consultationPrompt";
 import { normaliseConsultationAnalysis } from "@/lib/consultation";
+import {
+  attachSecondOpinions,
+  fetchLocalClassifierPrediction,
+} from "@/lib/localClassifier";
+import {
+  classifierModeFrom,
+  leadPromptBlock,
+  reconcileLeadAnalysis,
+  selectLeadRegions,
+} from "@/lib/classifierLead";
 import type { SkinAnalysis } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -59,6 +69,24 @@ export async function POST(req: Request) {
   }
   const client = new Anthropic({ apiKey });
 
+  // Clinic classifier (off unless LOCAL_CLASSIFIER_URL is set).
+  //   observe: the analysis is unchanged; agreement is reported alongside it.
+  //   lead:    the classifier picks the regions and the vision model may only
+  //            describe those. Falls back to model-led whenever the classifier
+  //            is unavailable or flags nothing, so an outage is never visible.
+  const classifierMode = classifierModeFrom(process.env.CLASSIFIER_MODE);
+  const classifierPromise =
+    classifierMode === "off"
+      ? Promise.resolve(null)
+      : fetchLocalClassifierPrediction(image, {
+          url: process.env.LOCAL_CLASSIFIER_URL,
+          secret: process.env.LOCAL_CLASSIFIER_SECRET,
+        });
+
+  const leadRegions =
+    classifierMode === "lead" ? selectLeadRegions(await classifierPromise) : [];
+  const leadBlock = leadRegions.length ? `\n\n${leadPromptBlock(leadRegions)}` : "";
+
   const callModel = async (nudge?: string) => {
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -81,7 +109,7 @@ export async function POST(req: Request) {
                 },
                 {
                   type: "text",
-                  text: nudge ?? consultationUserPrompt(),
+                  text: `${nudge ?? consultationUserPrompt()}${leadBlock}`,
                 },
               ],
             },
@@ -118,7 +146,44 @@ export async function POST(req: Request) {
         { status: 422 },
       );
     }
-    return NextResponse.json({ analysis: normaliseConsultationAnalysis(parsed) });
+    // Lead mode filters the RAW model JSON down to the flagged regions. What
+    // survives still goes through normaliseConsultationAnalysis, so every
+    // treatment shown is one treatmentRouteFor() chose from HSA's agreed
+    // routes — the classifier can never introduce one.
+    const leadOutcome = leadRegions.length
+      ? reconcileLeadAnalysis(parsed as unknown as Record<string, unknown>, leadRegions)
+      : null;
+    const effective = (leadOutcome?.raw ?? parsed) as unknown as SkinAnalysis;
+
+    const { analysis, summary: classifier } = attachSecondOpinions(
+      normaliseConsultationAnalysis(effective),
+      await classifierPromise,
+    );
+
+    if (classifier) {
+      console.info(
+        `[analyze] classifier ${classifier.modelVersion} mode=${classifierMode} agreed=${classifier.agreed} disagreed=${classifier.disagreed} unmapped=${classifier.unmappedAreas}`,
+      );
+    }
+
+    return NextResponse.json({
+      analysis,
+      ...(classifier ? { classifier } : {}),
+      ...(leadOutcome
+        ? {
+            lead:
+              leadOutcome.mode === "lead"
+                ? {
+                    mode: "lead" as const,
+                    regions: leadOutcome.regions.map((r) => r.label),
+                    vetoed: leadOutcome.vetoed,
+                    dropped: leadOutcome.dropped,
+                    omitted: leadOutcome.omitted,
+                  }
+                : { mode: "fallback" as const, reason: leadOutcome.reason },
+          }
+        : {}),
+    });
   } catch (error) {
     console.error("[analyze] failed:", error);
     return NextResponse.json({ error: "Analysis failed. Please try again." }, { status: 502 });
