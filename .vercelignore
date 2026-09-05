@@ -7,3 +7,8 @@ email-templates
 .env*
 *.log
 .playwright-mcp
+# ad-production assets and smoke-test artifacts live next to the app but are not part of it
+remotion-ads
+ad-source-instagram
+tmp
+certificates
