@@ -147,3 +147,16 @@ test("reconciles a secondary marker when Sonnet varies the area wording", () => 
   assert.equal(result.annotations[1]?.priority, "medium");
   assert.equal(result.annotations[1]?.treatment, "Veluria skin-booster programme");
 });
+
+test("raised describing posture or expression does not trigger clinician review", () => {
+  const forehead = treatmentRouteFor({
+    area: "Forehead",
+    concern: "Fine horizontal lines",
+    reasoning: "Horizontal forehead lines are visible with raised brow position in this image.",
+  });
+  assert.notEqual(forehead, "Clinician assessment");
+  assert.equal(
+    treatmentRouteFor({ area: "Cheek", concern: "Raised lesion with crusting" }),
+    "Clinician assessment",
+  );
+});

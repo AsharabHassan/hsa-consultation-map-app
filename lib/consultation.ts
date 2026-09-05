@@ -137,7 +137,9 @@ export function treatmentRouteFor(
   const text = concernText(item);
 
   if (
-    /active|inflam|raised|bleed|crust|scal|rash|wound|ulcer|infection|suspicious|lesion|mole|skin tag|vessel|thread vein|medical condition/.test(
+    // "raised" only counts when it describes a skin feature ("raised lesion"), not
+    // posture or expression ("raised brow position"), which is normal for lines.
+    /active|inflam|raised (?:lesion|bump|spot|mole|patch|area|growth|lump|nodule|skin|edge|border)|bleed|crust|scal|rash|wound|ulcer|infection|suspicious|lesion|mole|skin tag|vessel|thread vein|medical condition/.test(
       text,
     )
   ) {
